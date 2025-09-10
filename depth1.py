@@ -29,6 +29,7 @@ ALERT_CONFIG = {
     'volume_spike_threshold': 2.0,  # Multiple of average volume
     'price_level_break_threshold': 5,  # Number of levels broken through
     'order_flow_momentum_threshold': 0.7,  # Order flow momentum score
+    'single_order_threshold': 300,  # 👈 NEW
 }
 
 INSTITUTIONAL_DETECTION_CONFIG = {
@@ -71,6 +72,7 @@ class AlertEngine:
         
         # Run alert detection algorithms
         alerts.extend(self._detect_large_orders(security_id, bid_data, ask_data, timestamp))
+        alerts.extend(self._detect_single_large_orders(security_id, bid_data, ask_data, timestamp))  # 👈 NEW
         alerts.extend(self._detect_order_imbalance(security_id, metrics, timestamp))
         alerts.extend(self._detect_spread_compression(security_id, metrics, timestamp))
         alerts.extend(self._detect_iceberg_orders(security_id, bid_data, ask_data, timestamp))
@@ -352,6 +354,39 @@ class AlertEngine:
             })
         
         return alerts
+    
+    def _detect_single_large_orders(self, security_id: str, bid_data: List[Dict], ask_data: List[Dict], timestamp: datetime) -> List[Dict]:
+        """Detect when a single order exceeds threshold (e.g. >300 qty)"""
+        alerts = []
+        threshold = ALERT_CONFIG.get('single_order_threshold', 300)
+
+        # Check bids
+        for level in bid_data:
+            if level['orders'] == 1 and level['quantity'] >= threshold:
+                alerts.append({
+                    'type': 'SINGLE_LARGE_BID_ORDER',
+                    'security_id': security_id,
+                    'timestamp': timestamp,
+                    'price': level['price'],
+                    'quantity': level['quantity'],
+                    'severity': 'HIGH',
+                    'message': f"Single large bid: {level['quantity']} @ {level['price']}"
+                })
+
+        # Check asks
+        for level in ask_data:
+            if level['orders'] == 1 and level['quantity'] >= threshold:
+                alerts.append({
+                    'type': 'SINGLE_LARGE_ASK_ORDER',
+                    'security_id': security_id,
+                    'timestamp': timestamp,
+                    'price': level['price'],
+                    'quantity': level['quantity'],
+                    'severity': 'HIGH',
+                    'message': f"Single large ask: {level['quantity']} @ {level['price']}"
+                })
+        return alerts
+
     
     def _update_history(self, security_id: str, metrics: Dict):
         """Update historical data"""
@@ -1096,6 +1131,11 @@ def render_enhanced_depth_view(sec_id: str):
             help="Positive = More bid orders, Negative = More ask orders"
         )
     
+    # Current mid-price
+    current_price = (best_bid['price'] + best_ask['price']) / 2
+    st.metric("Current Price", f"₹{current_price:.2f}")
+
+    
     # Market depth table
     st.subheader("Market Depth Table")
     df = build_combined_df_for_security(sec_id)
@@ -1130,6 +1170,10 @@ def render_alert_panel():
             st.number_input("Volume Spike Threshold", 
                           value=ALERT_CONFIG['volume_spike_threshold'], 
                           key="volume_spike_threshold")
+            st.number_input("Single Order Threshold",
+                          value=ALERT_CONFIG['single_order_threshold'],
+                          key="single_order_threshold")
+
         with col2:
             st.number_input("Spread Compression %", 
                           value=ALERT_CONFIG['spread_compression_threshold'], 
