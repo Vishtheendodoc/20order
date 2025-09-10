@@ -31,6 +31,17 @@ ALERT_CONFIG = {
     'order_flow_momentum_threshold': 0.7,  # Order flow momentum score
 }
 
+INSTITUTIONAL_DETECTION_CONFIG = {
+    # Nifty-specific settings (adjust for other instruments)
+    'nifty_lot_size': 75,
+    'institutional_single_order_threshold': 300,  # 4+ lots in single order
+    'institutional_quantity_threshold': 750,      # 10+ lots total
+    'retail_fragmentation_threshold': 0.7,        # 70% of orders are lot-sized
+    'institutional_order_concentration_threshold': 0.3,  # 30% of quantity in few orders
+    'block_deal_threshold': 7500,                # 100+ lots (potential block deal)
+    'order_size_variance_threshold': 2.0,        # High variance indicates mixed player types
+}
+
 # ---------------------------
 # Alert Detection Classes
 # ---------------------------
@@ -66,6 +77,7 @@ class AlertEngine:
         alerts.extend(self._detect_volume_spikes(security_id, metrics, timestamp))
         alerts.extend(self._detect_level_breaks(security_id, bid_data, ask_data, timestamp))
         alerts.extend(self._detect_order_flow_momentum(security_id, metrics, timestamp))
+        alerts.extend(self.detect_institutional_patterns(security_id, bid_data, ask_data, timestamp))
         
         # Update history
         self._update_history(security_id, metrics)
@@ -399,6 +411,254 @@ class AlertEngine:
             'most_active_security': most_active_security,
             'last_alert_time': recent_alerts[-1]['timestamp'] if recent_alerts else None
         }
+
+    def detect_institutional_patterns(self, security_id: str, bid_data: List[Dict], 
+                                    ask_data: List[Dict], timestamp: datetime) -> List[Dict]:
+        """Detect institutional trading patterns"""
+        if not hasattr(self, 'institutional_detector'):
+            self.institutional_detector = EnhancedInstitutionalDetection(self)
+        
+        return self.institutional_detector.detect_institutional_activity(
+            security_id, bid_data, ask_data, timestamp
+        )
+    
+class EnhancedInstitutionalDetection:
+    """Enhanced detection for institutional vs retail trading patterns"""
+    
+    def __init__(self, alert_engine):
+        self.alert_engine = alert_engine
+        self.lot_sizes = {
+            # Add more instruments and their lot sizes as needed
+            'nifty': 75,
+            'banknifty': 25,
+            'default': 1
+        }
+    
+    def detect_institutional_activity(self, security_id: str, bid_data: List[Dict], 
+                                    ask_data: List[Dict], timestamp: datetime) -> List[Dict]:
+        """Main institutional detection function"""
+        alerts = []
+        
+        # Determine lot size for this security (you might want to maintain a mapping)
+        lot_size = self._get_lot_size(security_id)
+        
+        # Analyze bid side
+        bid_analysis = self._analyze_order_structure(bid_data, lot_size, "BID")
+        alerts.extend(self._generate_institutional_alerts(security_id, bid_analysis, timestamp, "BID"))
+        
+        # Analyze ask side
+        ask_analysis = self._analyze_order_structure(ask_data, lot_size, "ASK")
+        alerts.extend(self._generate_institutional_alerts(security_id, ask_analysis, timestamp, "ASK"))
+        
+        # Cross-side analysis
+        alerts.extend(self._analyze_cross_side_patterns(security_id, bid_analysis, ask_analysis, timestamp))
+        
+        return alerts
+    
+    def _get_lot_size(self, security_id: str) -> int:
+        """Get lot size for security - you can enhance this with a proper mapping"""
+        # Simple heuristic - you should maintain a proper instrument master
+        if 'nifty' in security_id.lower() or security_id in ['26009', '26000']:
+            return 75
+        elif 'bank' in security_id.lower() or security_id in ['26009']:  # BankNifty token
+            return 25
+        return 1  # For equity or unknown instruments
+    
+    def _analyze_order_structure(self, levels: List[Dict], lot_size: int, side: str) -> Dict:
+        """Analyze order structure to identify institutional patterns"""
+        if not levels:
+            return {}
+        
+        total_quantity = sum(level['quantity'] for level in levels)
+        total_orders = sum(level['orders'] for level in levels)
+        
+        if total_orders == 0:
+            return {}
+        
+        # Order size analysis
+        order_sizes = []
+        lot_aligned_orders = 0
+        institutional_indicators = []
+        
+        for level in levels:
+            if level['orders'] > 0:
+                avg_order_size = level['quantity'] / level['orders']
+                order_sizes.append(avg_order_size)
+                
+                # Check if orders are lot-aligned (typical retail behavior)
+                if abs(avg_order_size % lot_size) < (lot_size * 0.1):  # Within 10% of lot size
+                    lot_aligned_orders += level['orders']
+                
+                # Single large order indicators
+                if level['orders'] == 1 and level['quantity'] >= INSTITUTIONAL_DETECTION_CONFIG['institutional_single_order_threshold']:
+                    institutional_indicators.append({
+                        'type': 'single_large_order',
+                        'price': level['price'],
+                        'quantity': level['quantity'],
+                        'lot_multiple': level['quantity'] / lot_size
+                    })
+                
+                # Block deal detection
+                if level['quantity'] >= INSTITUTIONAL_DETECTION_CONFIG['block_deal_threshold']:
+                    institutional_indicators.append({
+                        'type': 'block_deal_size',
+                        'price': level['price'],
+                        'quantity': level['quantity'],
+                        'orders': level['orders'],
+                        'lot_multiple': level['quantity'] / lot_size
+                    })
+        
+        # Calculate metrics
+        avg_order_size = np.mean(order_sizes) if order_sizes else 0
+        order_size_variance = np.var(order_sizes) if len(order_sizes) > 1 else 0
+        retail_fragmentation_ratio = lot_aligned_orders / total_orders if total_orders > 0 else 0
+        
+        # Concentration analysis - check if few orders control large quantity
+        levels_by_qty = sorted(levels, key=lambda x: x['quantity'], reverse=True)
+        top_3_quantity = sum(level['quantity'] for level in levels_by_qty[:3])
+        concentration_ratio = top_3_quantity / total_quantity if total_quantity > 0 else 0
+        
+        return {
+            'side': side,
+            'total_quantity': total_quantity,
+            'total_orders': total_orders,
+            'avg_order_size': avg_order_size,
+            'order_size_variance': order_size_variance,
+            'retail_fragmentation_ratio': retail_fragmentation_ratio,
+            'concentration_ratio': concentration_ratio,
+            'institutional_indicators': institutional_indicators,
+            'lot_size': lot_size
+        }
+    
+    def _generate_institutional_alerts(self, security_id: str, analysis: Dict, 
+                                     timestamp: datetime, side: str) -> List[Dict]:
+        """Generate alerts based on institutional pattern analysis"""
+        alerts = []
+        
+        if not analysis:
+            return alerts
+        
+        # Single large order detection
+        for indicator in analysis.get('institutional_indicators', []):
+            if indicator['type'] == 'single_large_order':
+                alerts.append({
+                    'type': 'INSTITUTIONAL_SINGLE_ORDER',
+                    'security_id': security_id,
+                    'timestamp': timestamp,
+                    'side': side,
+                    'price': indicator['price'],
+                    'quantity': indicator['quantity'],
+                    'lot_multiple': indicator['lot_multiple'],
+                    'severity': 'HIGH',
+                    'message': f"Institutional single order: {indicator['quantity']} ({indicator['lot_multiple']:.1f} lots) on {side} @ {indicator['price']}"
+                })
+            
+            elif indicator['type'] == 'block_deal_size':
+                alerts.append({
+                    'type': 'BLOCK_DEAL_DETECTED',
+                    'security_id': security_id,
+                    'timestamp': timestamp,
+                    'side': side,
+                    'price': indicator['price'],
+                    'quantity': indicator['quantity'],
+                    'orders': indicator['orders'],
+                    'lot_multiple': indicator['lot_multiple'],
+                    'severity': 'HIGH',
+                    'message': f"Block deal size: {indicator['quantity']} ({indicator['lot_multiple']:.0f} lots) in {indicator['orders']} orders on {side}"
+                })
+        
+        # High concentration with low fragmentation (institutional characteristic)
+        concentration = analysis.get('concentration_ratio', 0)
+        fragmentation = analysis.get('retail_fragmentation_ratio', 1)
+        
+        if (concentration >= INSTITUTIONAL_DETECTION_CONFIG['institutional_order_concentration_threshold'] and 
+            fragmentation <= (1 - INSTITUTIONAL_DETECTION_CONFIG['retail_fragmentation_threshold'])):
+            
+            alerts.append({
+                'type': 'INSTITUTIONAL_CONCENTRATION',
+                'security_id': security_id,
+                'timestamp': timestamp,
+                'side': side,
+                'concentration_ratio': concentration,
+                'fragmentation_ratio': fragmentation,
+                'total_quantity': analysis['total_quantity'],
+                'total_orders': analysis['total_orders'],
+                'severity': 'MEDIUM',
+                'message': f"Institutional pattern on {side}: {concentration:.1%} quantity concentration, low retail fragmentation"
+            })
+        
+        # High order size variance (mixed institutional and retail)
+        variance = analysis.get('order_size_variance', 0)
+        avg_size = analysis.get('avg_order_size', 0)
+        
+        if avg_size > 0 and variance > (avg_size * INSTITUTIONAL_DETECTION_CONFIG['order_size_variance_threshold']):
+            alerts.append({
+                'type': 'MIXED_PLAYER_ACTIVITY',
+                'security_id': security_id,
+                'timestamp': timestamp,
+                'side': side,
+                'order_size_variance': variance,
+                'avg_order_size': avg_size,
+                'severity': 'MEDIUM',
+                'message': f"Mixed player activity on {side}: High order size variance indicating both retail and institutional presence"
+            })
+        
+        return alerts
+    
+    def _analyze_cross_side_patterns(self, security_id: str, bid_analysis: Dict, 
+                                   ask_analysis: Dict, timestamp: datetime) -> List[Dict]:
+        """Analyze patterns across bid and ask sides"""
+        alerts = []
+        
+        if not bid_analysis or not ask_analysis:
+            return alerts
+        
+        # Institutional vs retail dominance on different sides
+        bid_institutional = (bid_analysis.get('concentration_ratio', 0) > 0.3 and 
+                           bid_analysis.get('retail_fragmentation_ratio', 1) < 0.3)
+        ask_institutional = (ask_analysis.get('concentration_ratio', 0) > 0.3 and 
+                           ask_analysis.get('retail_fragmentation_ratio', 1) < 0.3)
+        
+        if bid_institutional and not ask_institutional:
+            alerts.append({
+                'type': 'INSTITUTIONAL_BID_DOMINANCE',
+                'security_id': security_id,
+                'timestamp': timestamp,
+                'bid_concentration': bid_analysis.get('concentration_ratio', 0),
+                'ask_concentration': ask_analysis.get('concentration_ratio', 0),
+                'severity': 'HIGH',
+                'message': "Institutional dominance on bid side vs retail on ask side - potential accumulation"
+            })
+        
+        elif ask_institutional and not bid_institutional:
+            alerts.append({
+                'type': 'INSTITUTIONAL_ASK_DOMINANCE',
+                'security_id': security_id,
+                'timestamp': timestamp,
+                'bid_concentration': bid_analysis.get('concentration_ratio', 0),
+                'ask_concentration': ask_analysis.get('concentration_ratio', 0),
+                'severity': 'HIGH',
+                'message': "Institutional dominance on ask side vs retail on bid side - potential distribution"
+            })
+        
+        # Simultaneous large orders on both sides (possible arbitrage or hedging)
+        bid_large_orders = len([i for i in bid_analysis.get('institutional_indicators', []) 
+                              if i['type'] in ['single_large_order', 'block_deal_size']])
+        ask_large_orders = len([i for i in ask_analysis.get('institutional_indicators', []) 
+                              if i['type'] in ['single_large_order', 'block_deal_size']])
+        
+        if bid_large_orders > 0 and ask_large_orders > 0:
+            alerts.append({
+                'type': 'BILATERAL_INSTITUTIONAL_ACTIVITY',
+                'security_id': security_id,
+                'timestamp': timestamp,
+                'bid_large_orders': bid_large_orders,
+                'ask_large_orders': ask_large_orders,
+                'severity': 'HIGH',
+                'message': f"Institutional activity on both sides - possible arbitrage/hedging ({bid_large_orders} bid, {ask_large_orders} ask large orders)"
+            })
+        
+        return alerts
 
 # ---------------------------
 # Original classes with Alert Engine integration
@@ -916,6 +1176,19 @@ def render_alert_panel():
                     st.caption(f"Direction: {alert['direction']}, Imbalance: {alert['imbalance_ratio']:.2%}")
                 elif alert['type'] == 'VOLUME_SPIKE':
                     st.caption(f"Volume Ratio: {alert['volume_ratio']:.1f}x average")
+                # ADD THESE NEW LINES HERE:
+                elif alert['type'] == 'INSTITUTIONAL_SINGLE_ORDER':
+                    st.caption(f"Side: {alert['side']}, Price: {alert['price']}, Quantity: {alert['quantity']}, Lots: {alert['lot_multiple']:.1f}")
+                elif alert['type'] == 'BLOCK_DEAL_DETECTED':
+                    st.caption(f"Side: {alert['side']}, Price: {alert['price']}, Quantity: {alert['quantity']}, Orders: {alert['orders']}")
+                elif alert['type'] == 'INSTITUTIONAL_CONCENTRATION':
+                    st.caption(f"Side: {alert['side']}, Concentration: {alert['concentration_ratio']:.1%}")
+                elif alert['type'] in ['INSTITUTIONAL_BID_DOMINANCE', 'INSTITUTIONAL_ASK_DOMINANCE']:
+                    st.caption(f"Bid Conc: {alert['bid_concentration']:.1%}, Ask Conc: {alert['ask_concentration']:.1%}")
+                elif alert['type'] == 'BILATERAL_INSTITUTIONAL_ACTIVITY':
+                    st.caption(f"Bid Orders: {alert['bid_large_orders']}, Ask Orders: {alert['ask_large_orders']}")
+                elif alert['type'] == 'MIXED_PLAYER_ACTIVITY':
+                    st.caption(f"Side: {alert['side']}, Avg Order Size: {alert['avg_order_size']:.0f}")
                 
                 st.divider()
     else:
